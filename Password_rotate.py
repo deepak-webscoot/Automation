@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Magento & Server Password Update Script
-Final robust version with safe password generation
+Final robust version with auto n98-magerun2 download
 """
 
 import os
@@ -23,6 +23,7 @@ class Config:
     MYSQL_USER = "magentouser"
     MYSQL_HOST = "localhost"
     N98_MAGERUN_PATH = "n98-magerun2.phar"
+    N98_MAGERUN_URL = "https://files.magerun.net/n98-magerun2.phar"
     
     # Server details for email
     SERVER_IP = "18.133.102.195"
@@ -205,28 +206,73 @@ class PasswordManager:
         parts = self.magento_root.split('/')
         return parts[2] if len(parts) > 2 else None
 
-    def validate_n98_magerun(self):
-        """Validate n98-magerun2 is available and working"""
-        n98_path = Path(self.magento_root) / Config.N98_MAGERUN_PATH
-        if not n98_path.exists():
-            print(f"n98-magerun2.phar not found in {self.magento_root}")
-            return False
-        
-        # Test n98-magerun
+    def download_n98_magerun(self):
+        """Download n98-magerun2 to Magento root directory"""
         magento_owner = self.get_magento_owner()
         if not magento_owner:
-            print("Cannot determine Magento owner")
+            print("ERROR: Cannot determine Magento owner for download")
             return False
-            
-        test_cmd = f"su - {magento_owner} -c 'cd {shlex.quote(self.magento_root)} && php {Config.N98_MAGERUN_PATH} --version'"
-        success, output = self.run_command(test_cmd, shell=True)
         
-        if success:
-            print("n98-magerun2.phar is working")
-            return True
-        else:
-            print("n98-magerun2.phar is not working")
+        print(f"📥 Downloading n98-magerun2.phar to {self.magento_root}...")
+        
+        # Download commands
+        download_cmd = f"su - {magento_owner} -c 'cd {shlex.quote(self.magento_root)} && wget -q {Config.N98_MAGERUN_URL} -O {Config.N98_MAGERUN_PATH}'"
+        chmod_cmd = f"su - {magento_owner} -c 'cd {shlex.quote(self.magento_root)} && chmod +x {Config.N98_MAGERUN_PATH}'"
+        
+        # Execute download and setup
+        download_success, download_output = self.run_command(download_cmd, shell=True)
+        if not download_success:
+            print(f"❌ Failed to download n98-magerun2.phar: {download_output}")
             return False
+        
+        chmod_success, chmod_output = self.run_command(chmod_cmd, shell=True)
+        if not chmod_success:
+            print(f"❌ Downloaded but failed to make executable: {chmod_output}")
+            return False
+        
+        # Verify the download worked
+        n98_path = Path(self.magento_root) / Config.N98_MAGERUN_PATH
+        if n98_path.exists():
+            print("✅ Successfully downloaded n98-magerun2.phar")
+            
+            # Test if it works
+            test_cmd = f"su - {magento_owner} -c 'cd {shlex.quote(self.magento_root)} && php {Config.N98_MAGERUN_PATH} --version'"
+            test_success, test_output = self.run_command(test_cmd, shell=True)
+            
+            if test_success:
+                print("✅ n98-magerun2.phar is working correctly")
+                return True
+            else:
+                print("❌ n98-magerun2.phar downloaded but not working")
+                return False
+        else:
+            print("❌ Download completed but file not found")
+            return False
+
+    def validate_n98_magerun(self):
+        """Validate n98-magerun2 is available and working, download if missing"""
+        n98_path = Path(self.magento_root) / Config.N98_MAGERUN_PATH
+        
+        # Check if n98-magerun exists and is working
+        if n98_path.exists():
+            # Test n98-magerun
+            magento_owner = self.get_magento_owner()
+            if not magento_owner:
+                print("Cannot determine Magento owner")
+                return False
+                
+            test_cmd = f"su - {magento_owner} -c 'cd {shlex.quote(self.magento_root)} && php {Config.N98_MAGERUN_PATH} --version'"
+            success, output = self.run_command(test_cmd, shell=True)
+            
+            if success:
+                print("✅ n98-magerun2.phar is working")
+                return True
+            else:
+                print("⚠️ n98-magerun2.phar exists but not working. Reinstalling...")
+        
+        # Download n98-magerun2 if missing or not working
+        print("n98-magerun2.phar not found. Downloading...")
+        return self.download_n98_magerun()
 
     def validate_configuration(self):
         """Validate system configuration"""
@@ -234,31 +280,31 @@ class PasswordManager:
         
         # Check Magento root
         if not Path(self.magento_root).exists():
-            print("ERROR: Magento root directory not found")
+            print("❌ ERROR: Magento root directory not found")
             return False
         else:
-            print("Magento root directory exists")
+            print("✅ Magento root directory exists")
         
         # Check env.php
         if not Path(self.magento_env_file).exists():
-            print("ERROR: Magento env.php not found")
+            print("❌ ERROR: Magento env.php not found")
             return False
         else:
-            print("Magento env.php exists")
+            print("✅ Magento env.php exists")
         
         # Check Magento owner
         magento_owner = self.get_magento_owner()
         if not magento_owner:
-            print("ERROR: Could not determine Magento owner")
+            print("❌ ERROR: Could not determine Magento owner")
             return False
         else:
-            print(f"Magento owner: {magento_owner}")
+            print(f"✅ Magento owner: {magento_owner}")
         
-        # Validate n98-magerun
+        # Validate n98-magerun (this will auto-download if missing)
         if not self.validate_n98_magerun():
             return False
         
-        print("All system checks passed")
+        print("✅ All system checks passed")
         return True
 
     def update_magento_passwords(self):
@@ -311,17 +357,17 @@ EOF"""
             success, output = self.run_command(cmd, shell=True)
             
             if success and "Password successfully changed" in output:
-                print(f"Successfully updated password for {user}")
+                print(f"✅ Successfully updated password for {user}")
                 self.password_changes["magento_users"][user] = password
                 success_count += 1
             else:
-                print(f"Failed to update password for {user}")
+                print(f"❌ Failed to update password for {user}")
                 if output:
                     # Show only first line of error to avoid clutter
                     error_line = output.split('\n')[0] if output else "Unknown error"
                     print(f"Error: {error_line}")
         
-        print(f"Summary: {success_count}/{len(Config.MAGENTO_USERS)} users updated successfully")
+        print(f"📊 Summary: {success_count}/{len(Config.MAGENTO_USERS)} users updated successfully")
 
     def update_virtualmin_password(self):
         """Update Virtualmin password"""
@@ -350,11 +396,11 @@ EOF"""
         success, output = self.run_command(" ".join(shlex.quote(arg) for arg in cmd), shell=False)
         
         if success:
-            print(f"Successfully updated Virtualmin password for {Config.VIRTUALMIN_USER}")
+            print(f"✅ Successfully updated Virtualmin password for {Config.VIRTUALMIN_USER}")
             self.password_changes["virtualmin"]["password"] = new_password
             self.password_changes["virtualmin"]["updated"] = True
         else:
-            print(f"Failed to update Virtualmin password for {Config.VIRTUALMIN_USER}")
+            print(f"❌ Failed to update Virtualmin password for {Config.VIRTUALMIN_USER}")
 
     def update_database_password(self):
         """Update MySQL database password"""
@@ -384,12 +430,12 @@ EOF"""
         success, output = self.run_command(mysql_cmd, shell=True)
         
         if not success:
-            print(f"Failed to update MySQL password for {Config.MYSQL_USER}")
+            print(f"❌ Failed to update MySQL password for {Config.MYSQL_USER}")
             if output:
                 print(f"Error: {output}")
             return
         
-        print(f"Successfully updated MySQL password for {Config.MYSQL_USER}")
+        print(f"✅ Successfully updated MySQL password for {Config.MYSQL_USER}")
         
         # Update Magento env.php
         print("Updating Magento configuration file...")
@@ -415,11 +461,11 @@ EOF"""
             with open(self.magento_env_file, 'w') as f:
                 f.write(new_content)
             
-            print("Successfully updated Magento configuration file")
+            print("✅ Successfully updated Magento configuration file")
             self.password_changes["mysql"]["password"] = new_password
             self.password_changes["mysql"]["updated"] = True
         except Exception as e:
-            print(f"Failed to update Magento configuration file: {e}")
+            print(f"❌ Failed to update Magento configuration file: {e}")
             print("The MySQL password was updated but the config file was not.")
             print(f"Please manually update {self.magento_env_file} with the new password.")
 
