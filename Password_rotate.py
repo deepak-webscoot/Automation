@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Magento & Server Password Update Script
-Clean, professional version that only acts on explicit user commands
+Final robust version with safe password generation
 """
 
 import os
@@ -23,12 +23,25 @@ class Config:
     MYSQL_USER = "magentouser"
     MYSQL_HOST = "localhost"
     N98_MAGERUN_PATH = "n98-magerun2.phar"
+    
+    # Server details for email
+    SERVER_IP = "18.133.102.195"
+    SSH_PORT = "2283"
+    MAGENTO_URL = "https://www.smartcellular.co.uk/ServerAdmin/"
+    VIRTUALMIN_URL = "https://18-133-102-195.hyperxapps.com:10000"
+    DB_NAME = "smrtcell_db"
+    DB_USER = "smart_usr"
 
 class PasswordManager:
     def __init__(self):
         self.magento_root = ""
         self.magento_env_file = ""
         self.log_file = f"/tmp/password_update_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        self.password_changes = {
+            "virtualmin": {"password": "", "updated": False},
+            "mysql": {"password": "", "updated": False},
+            "magento_users": {}
+        }
         self.setup_logging()
         
     def setup_logging(self):
@@ -53,40 +66,75 @@ class PasswordManager:
         try:
             self.logger.info(f"Executing: {command}")
             if shell:
-                result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True)
+                # Use subprocess with proper escaping for shell commands
+                result = subprocess.run(command, shell=True, check=True, capture_output=True, text=True, executable='/bin/bash')
             else:
+                # Use list format for non-shell commands
                 result = subprocess.run(shlex.split(command), check=True, capture_output=True, text=True)
             return True, result.stdout.strip()
         except subprocess.CalledProcessError as e:
-            error_msg = f"Command failed: {e.stderr if e.stderr else e}"
+            error_msg = f"Command failed: {e.stderr if e.stderr else str(e)}"
+            self.logger.error(error_msg)
+            return False, error_msg
+        except Exception as e:
+            error_msg = f"Unexpected error executing command: {str(e)}"
             self.logger.error(error_msg)
             return False, error_msg
 
     def prompt_yes_no(self, question):
         """Prompt for yes/no confirmation"""
         while True:
-            response = input(f"{question} (y/n): ").lower().strip()
-            if response in ['y', 'yes']:
-                return True
-            elif response in ['n', 'no']:
+            try:
+                response = input(f"{question} (y/n): ").lower().strip()
+                if response in ['y', 'yes']:
+                    return True
+                elif response in ['n', 'no']:
+                    return False
+                else:
+                    print("Please answer with 'y' or 'n'")
+            except (KeyboardInterrupt, EOFError):
+                print("\nOperation cancelled by user")
                 return False
-            else:
-                print("Please answer with 'y' or 'n'")
 
     def prompt_input(self, question, default=None):
         """Prompt for input with optional default"""
-        if default:
-            question = f"{question} [{default}]: "
-        else:
-            question = f"{question}: "
-        
-        response = input(question).strip()
-        return response if response else default
+        try:
+            if default:
+                question = f"{question} [{default}]: "
+            else:
+                question = f"{question}: "
+            
+            response = input(question).strip()
+            return response if response else default
+        except (KeyboardInterrupt, EOFError):
+            print("\nOperation cancelled by user")
+            return None
 
-    def generate_password(self, length=16):
-        """Generate strong random password"""
-        chars = string.ascii_letters + string.digits + "!@#$%^&*"
-        return ''.join(random.choice(chars) for _ in range(length))
+    def generate_safe_password(self, length=16):
+        """Generate strong random password WITHOUT problematic shell characters"""
+        # SAFE characters only - no !, $, &, *, #, ', ", `, \, |, ;, <, >, (, ), [, ], {, }
+        upper = string.ascii_uppercase
+        lower = string.ascii_lowercase
+        digits = string.digits
+        # Only safe special characters that don't break shell commands
+        safe_special = "-_+=@~."
+        
+        all_chars = upper + lower + digits + safe_special
+        
+        # Ensure password has at least one of each type
+        password = [
+            random.choice(upper),
+            random.choice(lower),
+            random.choice(digits),
+            random.choice(safe_special)
+        ]
+        
+        # Fill remaining characters
+        password.extend(random.choice(all_chars) for _ in range(length - 4))
+        
+        # Shuffle and join
+        random.shuffle(password)
+        return ''.join(password)
 
     def detect_magento_root(self):
         """Detect Magento root directory"""
@@ -116,6 +164,8 @@ class PasswordManager:
             while True:
                 try:
                     choice = self.prompt_input(f"Select installation (1-{len(detected_paths)})", "1")
+                    if choice is None:
+                        return False
                     selected_index = int(choice) - 1
                     if 0 <= selected_index < len(detected_paths):
                         self.magento_root = detected_paths[selected_index]
@@ -133,9 +183,11 @@ class PasswordManager:
         """Manual Magento path input"""
         while True:
             path = self.prompt_input("Please enter Magento root directory")
+            if path is None:
+                return False
             if not path:
                 print("Magento root directory is required")
-                return False
+                continue
             
             path = path.rstrip('/')
             env_file = Path(path) / "app/etc/env.php"
@@ -162,6 +214,10 @@ class PasswordManager:
         
         # Test n98-magerun
         magento_owner = self.get_magento_owner()
+        if not magento_owner:
+            print("Cannot determine Magento owner")
+            return False
+            
         test_cmd = f"su - {magento_owner} -c 'cd {shlex.quote(self.magento_root)} && php {Config.N98_MAGERUN_PATH} --version'"
         success, output = self.run_command(test_cmd, shell=True)
         
@@ -206,7 +262,7 @@ class PasswordManager:
         return True
 
     def update_magento_passwords(self):
-        """Update Magento admin passwords - ONLY when explicitly requested"""
+        """Update Magento admin passwords"""
         print("=== Update Magento Admin Passwords ===")
         
         # Show users that will be updated
@@ -219,14 +275,14 @@ class PasswordManager:
             print("Magento password updates cancelled")
             return
         
-        # Generate passwords
+        # Generate SAFE passwords
         passwords = {}
-        print("Generating passwords...")
+        print("Generating safe passwords...")
         for user in Config.MAGENTO_USERS:
-            passwords[user] = self.generate_password(16)
+            passwords[user] = self.generate_safe_password(16)
         
         # Show generated passwords
-        print("Generated passwords:")
+        print("Generated passwords (safe characters only):")
         for user, password in passwords.items():
             print(f"  {user}: {password}")
         
@@ -237,27 +293,38 @@ class PasswordManager:
         
         # Update each user
         magento_owner = self.get_magento_owner()
+        if not magento_owner:
+            print("ERROR: Cannot determine Magento owner")
+            return
+            
         success_count = 0
         
         for user, password in passwords.items():
             print(f"Updating password for {user}...")
             
-            # Use the exact command format from original script
-            escaped_password = shlex.quote(password)
-            cmd = f"su - {magento_owner} -c 'cd {shlex.quote(self.magento_root)} && php {Config.N98_MAGERUN_PATH} admin:user:change-password {shlex.quote(user)} {escaped_password}'"
+            # Use HEREDOC style to avoid all shell escaping issues
+            cmd = f"""su - {magento_owner} << 'EOF'
+cd {shlex.quote(self.magento_root)}
+php {Config.N98_MAGERUN_PATH} admin:user:change-password {shlex.quote(user)} {shlex.quote(password)}
+EOF"""
             
             success, output = self.run_command(cmd, shell=True)
             
             if success and "Password successfully changed" in output:
                 print(f"Successfully updated password for {user}")
+                self.password_changes["magento_users"][user] = password
                 success_count += 1
             else:
                 print(f"Failed to update password for {user}")
+                if output:
+                    # Show only first line of error to avoid clutter
+                    error_line = output.split('\n')[0] if output else "Unknown error"
+                    print(f"Error: {error_line}")
         
         print(f"Summary: {success_count}/{len(Config.MAGENTO_USERS)} users updated successfully")
 
     def update_virtualmin_password(self):
-        """Update Virtualmin password - ONLY when explicitly requested"""
+        """Update Virtualmin password"""
         print("=== Update Virtualmin Password ===")
         
         print(f"Domain: {Config.VIRTUALMIN_DOMAIN}")
@@ -268,8 +335,8 @@ class PasswordManager:
             print("Virtualmin password update cancelled")
             return
         
-        # Generate password
-        new_password = self.generate_password(16)
+        # Generate SAFE password
+        new_password = self.generate_safe_password(16)
         print(f"Generated password: {new_password}")
         
         # Final confirmation
@@ -277,19 +344,20 @@ class PasswordManager:
             print("Virtualmin password update cancelled")
             return
         
-        # Use the exact command from original script
-        cmd = f"virtualmin modify-domain --domain {Config.VIRTUALMIN_DOMAIN} --pass {shlex.quote(new_password)}"
+        # Use list format to avoid shell escaping issues
+        cmd = ["virtualmin", "modify-domain", "--domain", Config.VIRTUALMIN_DOMAIN, "--pass", new_password]
         
-        success, output = self.run_command(cmd, shell=False)
+        success, output = self.run_command(" ".join(shlex.quote(arg) for arg in cmd), shell=False)
         
         if success:
             print(f"Successfully updated Virtualmin password for {Config.VIRTUALMIN_USER}")
-            print(f"New password: {new_password}")
+            self.password_changes["virtualmin"]["password"] = new_password
+            self.password_changes["virtualmin"]["updated"] = True
         else:
             print(f"Failed to update Virtualmin password for {Config.VIRTUALMIN_USER}")
 
     def update_database_password(self):
-        """Update MySQL database password - ONLY when explicitly requested"""
+        """Update MySQL database password"""
         print("=== Update MySQL Database Password ===")
         
         print(f"MySQL User: {Config.MYSQL_USER}")
@@ -301,8 +369,8 @@ class PasswordManager:
             print("MySQL password update cancelled")
             return
         
-        # Generate password
-        new_password = self.generate_password(16)
+        # Generate SAFE password
+        new_password = self.generate_safe_password(16)
         print(f"Generated password: {new_password}")
         
         # Final confirmation
@@ -310,13 +378,15 @@ class PasswordManager:
             print("MySQL password update cancelled")
             return
         
-        # Update MySQL password - using exact command from original script
-        mysql_cmd = f"mysql -e \"ALTER USER '{Config.MYSQL_USER}'@'{Config.MYSQL_HOST}' IDENTIFIED BY '{new_password}'; FLUSH PRIVILEGES;\""
+        # Use single quotes for MySQL command with safe password
+        mysql_cmd = f"mysql -e 'ALTER USER \"{Config.MYSQL_USER}\"@\"{Config.MYSQL_HOST}\" IDENTIFIED BY \"{new_password}\"; FLUSH PRIVILEGES;'"
         
         success, output = self.run_command(mysql_cmd, shell=True)
         
         if not success:
             print(f"Failed to update MySQL password for {Config.MYSQL_USER}")
+            if output:
+                print(f"Error: {output}")
             return
         
         print(f"Successfully updated MySQL password for {Config.MYSQL_USER}")
@@ -326,22 +396,35 @@ class PasswordManager:
         
         # Create backup
         backup_file = f"{self.magento_env_file}.backup.{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        self.run_command(f"cp {shlex.quote(self.magento_env_file)} {shlex.quote(backup_file)}", shell=True)
+        backup_success, backup_output = self.run_command(f"cp {shlex.quote(self.magento_env_file)} {shlex.quote(backup_file)}", shell=True)
         
-        # Update password in env.php using sed (same as original script)
-        sed_cmd = f"sed -i \"s/'password' => '.*'/'password' => '{new_password}'/\" {shlex.quote(self.magento_env_file)}"
-        success, output = self.run_command(sed_cmd, shell=True)
-        
-        if success:
-            print("Successfully updated Magento configuration file")
-            print(f"New MySQL password: {new_password}")
+        if backup_success:
+            print(f"Created backup: {backup_file}")
         else:
-            print("Failed to update Magento configuration file")
+            print(f"Warning: Failed to create backup: {backup_output}")
+        
+        # Update password in env.php using Python for reliability
+        try:
+            with open(self.magento_env_file, 'r') as f:
+                content = f.read()
+            
+            # Use regex to find and replace the password line
+            pattern = r"('password' => ')(.*?)(')"
+            new_content = re.sub(pattern, f"'password' => '{new_password}'", content)
+            
+            with open(self.magento_env_file, 'w') as f:
+                f.write(new_content)
+            
+            print("Successfully updated Magento configuration file")
+            self.password_changes["mysql"]["password"] = new_password
+            self.password_changes["mysql"]["updated"] = True
+        except Exception as e:
+            print(f"Failed to update Magento configuration file: {e}")
             print("The MySQL password was updated but the config file was not.")
             print(f"Please manually update {self.magento_env_file} with the new password.")
 
     def update_all_passwords(self):
-        """Update all passwords - ONLY when explicitly requested"""
+        """Update all passwords"""
         print("=== Update All Passwords ===")
         
         print("This will update:")
@@ -378,11 +461,129 @@ class PasswordManager:
         print("=== Current Configuration ===")
         print(f"Magento Root: {self.magento_root}")
         print(f"Magento Env File: {self.magento_env_file}")
-        print(f"Magento Owner: {self.get_magento_owner()}")
+        magento_owner = self.get_magento_owner()
+        print(f"Magento Owner: {magento_owner if magento_owner else 'Unknown'}")
         print(f"Log File: {self.log_file}")
         print(f"Magento Users: {', '.join(Config.MAGENTO_USERS)}")
         print(f"Virtualmin User: {Config.VIRTUALMIN_USER}")
         print(f"MySQL User: {Config.MYSQL_USER}")
+
+    def generate_email_draft(self):
+        """Generate email draft with only updated sections"""
+        email_sections = []
+        
+        # Check what was updated
+        virtualmin_updated = self.password_changes["virtualmin"]["updated"]
+        mysql_updated = self.password_changes["mysql"]["updated"]
+        magento_updated = bool(self.password_changes["magento_users"])
+        
+        # If nothing was updated, return None
+        if not virtualmin_updated and not mysql_updated and not magento_updated:
+            return None
+        
+        email_content = "Hi,\n\nPlease find the new server credentials as below:\n\n"
+        
+        # Virtualmin section - only if updated
+        if virtualmin_updated:
+            email_content += f"""Virtualmin:
+=================================
+URL: {Config.VIRTUALMIN_URL}
+User: {Config.VIRTUALMIN_USER}
+Password: {self.password_changes["virtualmin"]["password"]}
+=================================
+
+SSH
+=============================
+IP: {Config.SERVER_IP}
+User: {Config.VIRTUALMIN_USER}
+Password: {self.password_changes["virtualmin"]["password"]}
+Port: {Config.SSH_PORT}
+=============================
+
+SFTP
+=============================
+Host: sftp://{Config.SERVER_IP}
+User: {Config.VIRTUALMIN_USER}
+Password: {self.password_changes["virtualmin"]["password"]}
+Port: {Config.SSH_PORT}
+=============================
+
+"""
+
+        # Database section - only if updated
+        if mysql_updated:
+            email_content += f"""Database
+=================================
+DB_user: {Config.DB_USER}
+Password: {self.password_changes["mysql"]["password"]}
+DB_name: {Config.DB_NAME}
+=================================
+
+"""
+
+        # Magento users section - only if any were updated
+        if magento_updated:
+            email_content += f"""Magento Users:
+================================
+URL: {Config.MAGENTO_URL}
+"""
+            # Add only updated Magento users
+            for user in Config.MAGENTO_USERS:
+                if user in self.password_changes["magento_users"]:
+                    password = self.password_changes["magento_users"][user]
+                    email_content += f"""
+username: {user}
+Password: {password}
+"""
+            email_content += "================================\n"
+
+        # Add footer
+        email_content += f"""
+Generated on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Log file: {self.log_file}
+
+Best regards,
+System Administrator
+"""
+        return email_content
+
+    def save_email_draft(self):
+        """Save email draft to file and display it"""
+        email_content = self.generate_email_draft()
+        if not email_content:
+            print("No password changes were made during this session.")
+            return
+        
+        # Save to file
+        email_file = f"/tmp/password_update_email_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        try:
+            with open(email_file, 'w') as f:
+                f.write(email_content)
+            
+            print("\n" + "="*70)
+            print("EMAIL DRAFT GENERATED SUCCESSFULLY")
+            print("="*70)
+            
+            # Show what was updated
+            updates = []
+            if self.password_changes["virtualmin"]["updated"]:
+                updates.append("Virtualmin/SSH/SFTP")
+            if self.password_changes["mysql"]["updated"]:
+                updates.append("MySQL Database")
+            if self.password_changes["magento_users"]:
+                updated_magento_count = len(self.password_changes["magento_users"])
+                updates.append(f"Magento Users ({updated_magento_count} users)")
+            
+            print(f"Sections updated: {', '.join(updates)}")
+            print(f"Email draft saved to: {email_file}")
+            print("\nEmail Content:")
+            print("="*70)
+            print(email_content)
+            print("="*70)
+            print("\nYou can copy this content and send it via your email client.")
+            
+        except Exception as e:
+            print(f"Error saving email draft: {e}")
 
     def show_menu(self):
         """Main menu system"""
@@ -395,11 +596,14 @@ class PasswordManager:
             print("3. Update MySQL Database Password")
             print("4. Update ALL Passwords")
             print("5. Show Current Configuration")
-            print("6. Exit")
+            print("6. Exit and Generate Email Draft")
             print("="*50)
             
             choice = self.prompt_input("Select option", "1")
             
+            if choice is None:
+                continue
+                
             if choice == "1":
                 self.update_magento_passwords()
             elif choice == "2":
@@ -411,6 +615,7 @@ class PasswordManager:
             elif choice == "5":
                 self.show_configuration()
             elif choice == "6":
+                self.save_email_draft()
                 print("Exiting...")
                 break
             else:
@@ -444,8 +649,10 @@ class PasswordManager:
             
         except KeyboardInterrupt:
             print("\nScript interrupted by user")
+            self.save_email_draft()
         except Exception as e:
             print(f"Unexpected error: {e}")
+            self.logger.exception("Unexpected error occurred")
             sys.exit(1)
 
 def main():
